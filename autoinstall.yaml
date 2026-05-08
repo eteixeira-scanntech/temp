@@ -1,0 +1,223 @@
+#cloud-config
+autoinstall:
+  version: 1
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # VARIABLES DE CONFIGURACIÓN — Editar aquí antes de usar
+  # ════════════════════════════════════════════════════════════════════════════
+  #
+  #   CUSTOM_USER_NAME   → nombre de usuario del técnico/admin personalizado
+  #   CUSTOM_USER_REAL   → nombre real (visible) de ese usuario
+  #   HOSTNAME           → nombre del equipo en la red
+  #
+  # Los hashes de contraseña son un placeholder que fuerza cambio en 1er login.
+  # Genera uno real con:  openssl passwd -6 "PasswordTemporal"
+  # ════════════════════════════════════════════════════════════════════════════
+
+  # ── Localización y teclado ──────────────────────────────────────────────────
+  locale: es_ES.UTF-8
+  keyboard:
+    layout: es
+    variant: ""
+
+  # ── Red ─────────────────────────────────────────────────────────────────────
+  network:
+    version: 2
+    ethernets:
+      all-eth:
+        match:
+          name: "en*"
+        dhcp4: true
+
+  # ── Almacenamiento ──────────────────────────────────────────────────────────
+  storage:
+    layout:
+      name: lvm
+
+  # ── Usuario principal del sistema (requerido por autoinstall) ───────────────
+  # Este usuario se usa solo durante la instalación. Los dos usuarios reales
+  # se crean en late-commands con user-data / adduser.
+  identity:
+    hostname: ubuntu-intune          # ← CAMBIAR nombre del equipo
+    username: installer-temp
+    password: "$6$rounds=4096$temporalXXXX$hashedpasswordXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+    realname: "Instalador Temporal"
+
+  # ── SSH ─────────────────────────────────────────────────────────────────────
+  ssh:
+    install-server: true
+    allow-pw: true
+
+  # ── Paquetes base ────────────────────────────────────────────────────────────
+  packages:
+    - curl
+    - wget
+    - apt-transport-https
+    - ca-certificates
+    - gnupg
+    - lsb-release
+    - software-properties-common
+    - dconf-cli           # necesario para configurar GNOME/dock por script
+
+  updates: security
+
+  # ── Comandos post-instalación ───────────────────────────────────────────────
+  late-commands:
+
+    # ── 0. VARIABLES (editar aquí) ────────────────────────────────────────────
+    # Exportarlas como archivo para reutilizarlas en pasos siguientes
+    - |
+      cat > /target/tmp/intune-vars.sh << 'VARSEOF'
+      # ┌─────────────────────────────────────────────┐
+      # │  EDITAR ESTAS VARIABLES ANTES DE DESPLEGAR  │
+      # └─────────────────────────────────────────────┘
+      CUSTOM_USER_NAME="tecnico"          # nombre de usuario (sin espacios)
+      CUSTOM_USER_REAL="Técnico IT"       # nombre visible completo
+      SERVICEDESK_USER="service-desk"     # no cambiar salvo necesidad
+      # ──────────────────────────────────────────────
+      VARSEOF
+      chmod 600 /target/tmp/intune-vars.sh
+
+    # ── 1. Crear usuario service-desk ─────────────────────────────────────────
+    - |
+      curtin in-target -- bash -c "
+        source /tmp/intune-vars.sh
+
+        # Crear usuario sin contraseña inicial, con shell bash
+        adduser --disabled-password --gecos 'Service Desk,,,' \${SERVICEDESK_USER}
+
+        # Añadir a grupos necesarios (sudo para soporte remoto)
+        usermod -aG sudo \${SERVICEDESK_USER}
+
+        # Establecer contraseña temporal y forzar cambio obligatorio en 1er login
+        echo \"\${SERVICEDESK_USER}:CambiarEn1erLogin!\" | chpasswd
+        passwd --expire \${SERVICEDESK_USER}
+      "
+
+    # ── 2. Crear usuario personalizado (CUSTOM_USER) ──────────────────────────
+    - |
+      curtin in-target -- bash -c "
+        source /tmp/intune-vars.sh
+
+        adduser --disabled-password --gecos \"\${CUSTOM_USER_REAL},,,\" \${CUSTOM_USER_NAME}
+        usermod -aG sudo \${CUSTOM_USER_NAME}
+
+        # Contraseña temporal + expiración forzada
+        echo \"\${CUSTOM_USER_NAME}:CambiarEn1erLogin!\" | chpasswd
+        passwd --expire \${CUSTOM_USER_NAME}
+      "
+
+    # ── 3. Instalar Microsoft Intune (incluye Edge como dependencia) ──────────
+    - |
+      curtin in-target -- bash -c "
+        curl -fsSL \
+          'https://raw.githubusercontent.com/microsoft/shell-intune-samples/master/Linux/Intune%20Installer/installer.sh' \
+          -o /tmp/intune-installer.sh \
+        && chmod +x /tmp/intune-installer.sh \
+        && /tmp/intune-installer.sh --verbose >> /var/log/intune-install.log 2>&1
+      "
+
+    # ── 4. Configurar Edge como navegador por defecto (sistema) ──────────────
+    - |
+      curtin in-target -- bash -c "
+        # Esperar a que Edge esté instalado
+        if command -v microsoft-edge-stable &>/dev/null || \
+           dpkg -l microsoft-edge-stable &>/dev/null 2>&1; then
+
+          # Default a nivel de sistema mediante update-alternatives
+          update-alternatives --set x-www-browser \
+            /usr/bin/microsoft-edge-stable 2>/dev/null || true
+
+          # xdg-mime para MIME types de navegador
+          mkdir -p /etc/skel/.config
+          cat > /tmp/edge-defaults.sh << 'EDGEOF'
+      #!/bin/bash
+      xdg-mime default microsoft-edge.desktop text/html
+      xdg-mime default microsoft-edge.desktop x-scheme-handler/http
+      xdg-mime default microsoft-edge.desktop x-scheme-handler/https
+      xdg-mime default microsoft-edge.desktop x-scheme-handler/ftp
+      EDGEOF
+          chmod +x /tmp/edge-defaults.sh
+
+          # Registrar Edge como predeterminado en /etc/alternatives
+          update-alternatives --install /usr/bin/x-www-browser \
+            x-www-browser /usr/bin/microsoft-edge-stable 200 2>/dev/null || true
+          update-alternatives --install /usr/bin/gnome-www-browser \
+            gnome-www-browser /usr/bin/microsoft-edge-stable 200 2>/dev/null || true
+        else
+          echo 'AVISO: microsoft-edge-stable no encontrado aún' \
+            >> /var/log/intune-install.log
+        fi
+      "
+
+    # ── 5. Configurar dock de GNOME: quitar Firefox, poner Edge ──────────────
+    # Esto se aplica como perfil dconf por defecto para TODOS los usuarios nuevos
+    - |
+      curtin in-target -- bash -c "
+        mkdir -p /etc/dconf/profile
+        mkdir -p /etc/dconf/db/local.d
+        mkdir -p /etc/dconf/db/local.d/locks
+
+        # Perfil dconf: primero user, luego sistema
+        cat > /etc/dconf/profile/user << 'PROFEOF'
+      user-db:user
+      system-db:local
+      PROFEOF
+
+        # Configuración del dock para todos los usuarios
+        cat > /etc/dconf/db/local.d/01-dock << 'DOCKEOF'
+      [org/gnome/shell]
+      favorite-apps=['microsoft-edge.desktop', 'org.gnome.Nautilus.desktop', 'org.gnome.Terminal.desktop', 'snap-store_snap-store.desktop']
+
+      [org/gnome/shell/extensions/dash-to-dock]
+      show-trash=true
+      DOCKEOF
+
+        # Bloquear la configuración para que no sea modificada por usuarios
+        # (comentar las siguientes líneas si se quiere permitir al usuario cambiar el dock)
+        cat > /etc/dconf/db/local.d/locks/dock << 'LOCKEOF'
+      /org/gnome/shell/favorite-apps
+      LOCKEOF
+
+        # Aplicar la base de datos dconf
+        dconf update
+      "
+
+    # ── 6. Script de primer login para MIME types de Edge (por usuario) ───────
+    # Se ejecutará la primera vez que cada usuario inicie sesión
+    - |
+      cat > /target/etc/profile.d/99-set-edge-default.sh << 'PROFILEEOF'
+      #!/bin/bash
+      # Ejecutar solo una vez por usuario
+      MARKER="\${HOME}/.config/.edge-default-set"
+      if [ ! -f "\${MARKER}" ]; then
+        xdg-mime default microsoft-edge.desktop text/html          2>/dev/null
+        xdg-mime default microsoft-edge.desktop x-scheme-handler/http  2>/dev/null
+        xdg-mime default microsoft-edge.desktop x-scheme-handler/https 2>/dev/null
+        xdg-mime default microsoft-edge.desktop x-scheme-handler/ftp   2>/dev/null
+        touch "\${MARKER}"
+      fi
+      PROFILEEOF
+      chmod +x /target/etc/profile.d/99-set-edge-default.sh
+
+    # ── 7. Eliminar Firefox si estuviera instalado ────────────────────────────
+    - |
+      curtin in-target -- bash -c "
+        # Firefox snap
+        snap remove firefox 2>/dev/null || true
+        # Firefox deb (por si acaso)
+        apt-get remove -y --purge firefox 2>/dev/null || true
+        apt-get autoremove -y 2>/dev/null || true
+      "
+
+    # ── 8. Eliminar usuario temporal de instalación ───────────────────────────
+    - |
+      curtin in-target -- bash -c "
+        deluser --remove-home installer-temp 2>/dev/null || true
+      "
+
+    # ── 9. Firewall y limpieza ────────────────────────────────────────────────
+    - curtin in-target -- bash -c "ufw allow OpenSSH && ufw --force enable"
+    - curtin in-target -- apt-get -y autoremove --purge
+    - curtin in-target -- apt-get -y clean
+    - rm -f /target/tmp/intune-vars.sh   # limpiar variables con contraseñas
